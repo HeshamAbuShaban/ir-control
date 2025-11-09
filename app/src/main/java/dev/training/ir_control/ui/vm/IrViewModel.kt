@@ -4,15 +4,16 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dev.training.ir_control.data.PresetRepository
-import dev.training.ir_control.data.SamsungPresets
+import dev.training.ir_control.data.remote.RemoteBrand
+import dev.training.ir_control.data.remote.RemoteDevice
 import dev.training.ir_control.ir.IrController
 import dev.training.ir_control.ir.IrResult
 import dev.training.ir_control.model.BrandPreset
 import dev.training.ir_control.model.DeviceEntity
 import dev.training.ir_control.model.DevicePreset
 import dev.training.ir_control.model.IrCommand
-import dev.training.ir_control.model.Payload
 import javax.inject.Inject
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -24,27 +25,43 @@ class IrViewModel
 @Inject
 constructor(private val ir: IrController, private val repository: PresetRepository) : ViewModel() {
 
+    enum class SaveSource {
+        PRESET,
+        ONLINE
+    }
+
     data class UiState(
             val hasIr: Boolean? = null,
             val isLoading: Boolean = false,
-            val brands: List<BrandPreset> = emptyList(),
-            val selectedBrand: BrandPreset? = null,
-            val selectedDevice: DevicePreset? = null,
+            val presetBrands: List<BrandPreset> = emptyList(),
+            val selectedPresetBrand: BrandPreset? = null,
+            val selectedPresetDevice: DevicePreset? = null,
             val savedDevices: List<DeviceEntity> = emptyList(),
             val selectedSavedDevice: DeviceEntity? = null,
             val savedDeviceCommands: List<IrCommand> = emptyList(),
-            val lastResult: IrResult? = null,
-            val lastResultMessage: String? = null,
+            val onlineBrands: List<RemoteBrand> = emptyList(),
+            val selectedOnlineBrand: RemoteBrand? = null,
+            val onlineDevices: List<RemoteDevice> = emptyList(),
+            val selectedOnlineDevice: RemoteDevice? = null,
+            val onlineCommands: List<IrCommand> = emptyList(),
+            val isOnlineLoading: Boolean = false,
+            val snackbarMessage: String? = null,
             val showSaveDialog: Boolean = false,
-            val saveDeviceName: String = ""
+            val saveDeviceName: String = "",
+            val saveSource: SaveSource? = null,
+            val isSaving: Boolean = false,
+            val lastResult: IrResult? = null,
+            val lastResultMessage: String? = null
     )
 
     private val _state = MutableStateFlow(UiState())
     val state: StateFlow<UiState> = _state.asStateFlow()
 
+    private var savedCommandsJob: Job? = null
+
     init {
         loadPresets()
-        loadSavedDevices()
+        observeSavedDevices()
     }
 
     fun init() {
@@ -53,79 +70,152 @@ constructor(private val ir: IrController, private val repository: PresetReposito
 
     private fun loadPresets() {
         _state.update { it.copy(isLoading = true) }
-        val brands = SamsungPresets.getAllBrands()
+        val brands = repository.getDefaultPresets()
         _state.update {
             it.copy(
-                    brands = brands,
-                    selectedBrand = brands.firstOrNull(),
-                    selectedDevice = brands.firstOrNull()?.devices?.firstOrNull(),
+                    presetBrands = brands,
+                    selectedPresetBrand = brands.firstOrNull(),
+                    selectedPresetDevice = brands.firstOrNull()?.devices?.firstOrNull(),
                     isLoading = false
             )
         }
     }
 
-    private fun loadSavedDevices() {
+    private fun observeSavedDevices() {
         viewModelScope.launch {
-            repository.getAllDevices().collect { devices ->
+            repository.observeSavedDevices().collect { devices ->
                 _state.update { it.copy(savedDevices = devices) }
             }
         }
     }
 
-    fun selectBrand(brand: BrandPreset) {
+    fun selectPresetBrand(brand: BrandPreset) {
         _state.update {
-            it.copy(selectedBrand = brand, selectedDevice = brand.devices.firstOrNull())
+            it.copy(selectedPresetBrand = brand, selectedPresetDevice = brand.devices.firstOrNull())
         }
     }
 
-    fun selectDevice(device: DevicePreset?) {
-        _state.update { it.copy(selectedDevice = device) }
+    fun selectPresetDevice(device: DevicePreset?) {
+        _state.update { it.copy(selectedPresetDevice = device) }
     }
 
     fun selectSavedDevice(device: DeviceEntity?) {
         _state.update { it.copy(selectedSavedDevice = device) }
-        if (device != null) {
-            loadCommandsForSavedDevice(device.id)
-        } else {
+        savedCommandsJob?.cancel()
+        if (device == null) {
             _state.update { it.copy(savedDeviceCommands = emptyList()) }
+            return
         }
+        savedCommandsJob =
+                viewModelScope.launch {
+                    repository.observeCommands(device.id).collect { commands ->
+                        _state.update { it.copy(savedDeviceCommands = commands) }
+                    }
+                }
     }
 
-    private fun loadCommandsForSavedDevice(deviceId: Long) {
+    fun fetchBrands(force: Boolean = false) {
+        if (!force && _state.value.onlineBrands.isNotEmpty()) return
         viewModelScope.launch {
-            repository.getCommandsForDevice(deviceId).collect { commandEntities ->
-                val commands =
-                        commandEntities.map { cmdEntity ->
-                            val payload =
-                                    when (dev.training.ir_control.model.Protocol.valueOf(
-                                                    cmdEntity.protocol
-                                            )
-                                    ) {
-                                        dev.training.ir_control.model.Protocol.NEC ->
-                                                Payload.Nec(
-                                                        address = cmdEntity.address,
-                                                        command = cmdEntity.command
-                                                )
-                                        dev.training.ir_control.model.Protocol.SIRC ->
-                                                TODO("SIRC not implemented")
-                                        dev.training.ir_control.model.Protocol.RC5 ->
-                                                TODO("RC5 not implemented")
-                                    }
-                            IrCommand(label = cmdEntity.label, payload = payload)
+            _state.update { it.copy(isOnlineLoading = true, snackbarMessage = null) }
+            runCatching { repository.fetchRemoteBrands() }
+                    .onSuccess { brands ->
+                        _state.update {
+                            it.copy(
+                                    onlineBrands = brands,
+                                    isOnlineLoading = false,
+                                    selectedOnlineBrand = brands.firstOrNull(),
+                                    onlineDevices = emptyList(),
+                                    selectedOnlineDevice = null,
+                                    onlineCommands = emptyList()
+                            )
                         }
-                _state.update { it.copy(savedDeviceCommands = commands) }
-            }
+                        brands.firstOrNull()?.let { fetchDevices(it) }
+                    }
+                    .onFailure { error ->
+                        _state.update {
+                            it.copy(
+                                    isOnlineLoading = false,
+                                    snackbarMessage = error.message ?: "فشل تحميل العلامات"
+                            )
+                        }
+                    }
         }
     }
 
-    fun showSaveDialog() {
+    fun fetchDevices(brand: RemoteBrand) {
+        viewModelScope.launch {
+            _state.update {
+                it.copy(
+                        isOnlineLoading = true,
+                        selectedOnlineBrand = brand,
+                        onlineDevices = emptyList(),
+                        selectedOnlineDevice = null,
+                        onlineCommands = emptyList(),
+                        snackbarMessage = null
+                )
+            }
+            runCatching { repository.fetchRemoteDevices(brand.id) }
+                    .onSuccess { devices ->
+                        _state.update {
+                            it.copy(
+                                    isOnlineLoading = false,
+                                    onlineDevices = devices,
+                                    selectedOnlineDevice = devices.firstOrNull(),
+                                    onlineCommands = emptyList()
+                            )
+                        }
+                        devices.firstOrNull()?.let { fetchCommands(it) }
+                    }
+                    .onFailure { error ->
+                        _state.update {
+                            it.copy(
+                                    isOnlineLoading = false,
+                                    snackbarMessage = error.message ?: "فشل تحميل الأجهزة"
+                            )
+                        }
+                    }
+        }
+    }
+
+    fun fetchCommands(device: RemoteDevice) {
+        viewModelScope.launch {
+            _state.update {
+                it.copy(
+                        isOnlineLoading = true,
+                        selectedOnlineDevice = device,
+                        onlineCommands = emptyList(),
+                        snackbarMessage = null
+                )
+            }
+            runCatching { repository.fetchRemoteCommands(device.id) }
+                    .onSuccess { commands ->
+                        _state.update {
+                            it.copy(
+                                    isOnlineLoading = false,
+                                    onlineCommands = commands.map { it.toIrCommand() }
+                            )
+                        }
+                    }
+                    .onFailure { error ->
+                        _state.update {
+                            it.copy(
+                                    isOnlineLoading = false,
+                                    snackbarMessage = error.message ?: "فشل تحميل الأوامر"
+                            )
+                        }
+                    }
+        }
+    }
+
+    fun showSaveDialog(source: SaveSource, suggestedName: String) {
         _state.update {
-            it.copy(showSaveDialog = true, saveDeviceName = it.selectedBrand?.name ?: "")
+            it.copy(showSaveDialog = true, saveDeviceName = suggestedName, saveSource = source)
         }
     }
 
     fun hideSaveDialog() {
-        _state.update { it.copy(showSaveDialog = false, saveDeviceName = "") }
+        _state.update { it.copy(showSaveDialog = false, saveDeviceName = "", saveSource = null) }
     }
 
     fun updateSaveDeviceName(name: String) {
@@ -133,89 +223,183 @@ constructor(private val ir: IrController, private val repository: PresetReposito
     }
 
     fun saveCurrentDevice() {
-        val brandName = _state.value.saveDeviceName.trim()
-        val device = _state.value.selectedDevice
+        val state = _state.value
+        if (state.isSaving) return
+        val brandName = state.saveDeviceName.trim()
+        val source = state.saveSource
 
-        if (brandName.isEmpty() || device == null) {
+        if (brandName.isEmpty() || source == null) {
             _state.update {
                 it.copy(
-                        lastResult = IrResult.Err.Invalid("Brand name and device are required"),
-                        lastResultMessage = "Please enter a brand name and select a device"
+                        lastResult = IrResult.Err.Invalid("الاسم غير صالح"),
+                        lastResultMessage = "الرجاء إدخال اسم جهاز صحيح"
+                )
+            }
+            return
+        }
+
+        when (source) {
+            SaveSource.PRESET -> savePresetSelection(brandName)
+            SaveSource.ONLINE -> saveOnlineSelection(brandName)
+        }
+    }
+
+    private fun savePresetSelection(brandName: String) {
+        val state = _state.value
+        val brand = state.selectedPresetBrand
+        val device = state.selectedPresetDevice
+        if (brand == null || device == null) {
+            _state.update {
+                it.copy(
+                        lastResult = IrResult.Err.Invalid("لا يوجد جهاز محدد"),
+                        lastResultMessage = "اختر جهازًا لحفظه"
                 )
             }
             return
         }
 
         viewModelScope.launch {
-            try {
-                repository.saveDevice(brandName, device)
-                _state.update {
-                    it.copy(
-                            showSaveDialog = false,
-                            saveDeviceName = "",
-                            lastResult = IrResult.Ok("Device saved successfully"),
-                            lastResultMessage = "Device saved successfully"
-                    )
-                }
-            } catch (e: Exception) {
-                _state.update {
-                    it.copy(
-                            lastResult = IrResult.Err.Failure(e),
-                            lastResultMessage = "Error saving device: ${e.message}"
-                    )
-                }
+            _state.update { it.copy(isSaving = true) }
+            runCatching {
+                repository.saveDevice(
+                        brandName = brandName,
+                        protocol = brand.protocol,
+                        frequencyHz = brand.defaultFreqHz,
+                        devicePreset = device
+                )
             }
+                    .onSuccess {
+                        _state.update {
+                            it.copy(
+                                    isSaving = false,
+                                    showSaveDialog = false,
+                                    saveDeviceName = "",
+                                    saveSource = null,
+                                    lastResult = IrResult.Ok("تم الحفظ"),
+                                    lastResultMessage = "تم حفظ الجهاز بنجاح"
+                            )
+                        }
+                    }
+                    .onFailure { error ->
+                        _state.update {
+                            it.copy(
+                                    isSaving = false,
+                                    lastResult = IrResult.Err.Failure(error),
+                                    lastResultMessage = error.message ?: "خطأ أثناء الحفظ"
+                            )
+                        }
+                    }
+        }
+    }
+
+    private fun saveOnlineSelection(brandName: String) {
+        val state = _state.value
+        val brand = state.selectedOnlineBrand
+        val device = state.selectedOnlineDevice
+        val commands = state.onlineCommands
+        if (brand == null || device == null || commands.isEmpty()) {
+            _state.update {
+                it.copy(
+                        lastResult = IrResult.Err.Invalid("بيانات غير مكتملة"),
+                        lastResultMessage = "تأكد من اختيار جهاز وتحميل أوامره"
+                )
+            }
+            return
+        }
+
+        val devicePreset =
+                DevicePreset(
+                        model = device.name,
+                        commands = commands,
+                        protocolOverride = device.protocol,
+                        frequencyOverrideHz = device.frequencyHz
+                )
+
+        viewModelScope.launch {
+            _state.update { it.copy(isSaving = true) }
+            runCatching {
+                repository.saveDevice(
+                        brandName = brandName,
+                        protocol = device.protocol,
+                        frequencyHz = device.frequencyHz,
+                        devicePreset = devicePreset
+                )
+            }
+                    .onSuccess {
+                        _state.update {
+                            it.copy(
+                                    isSaving = false,
+                                    showSaveDialog = false,
+                                    saveDeviceName = "",
+                                    saveSource = null,
+                                    lastResult = IrResult.Ok("تم الحفظ"),
+                                    lastResultMessage = "تم حفظ الجهاز المستورد"
+                            )
+                        }
+                    }
+                    .onFailure { error ->
+                        _state.update {
+                            it.copy(
+                                    isSaving = false,
+                                    lastResult = IrResult.Err.Failure(error),
+                                    lastResultMessage = error.message ?: "تعذر حفظ الجهاز"
+                            )
+                        }
+                    }
         }
     }
 
     fun deleteSavedDevice(device: DeviceEntity) {
         viewModelScope.launch {
-            try {
-                repository.deleteDevice(device.id)
-                if (_state.value.selectedSavedDevice?.id == device.id) {
-                    _state.update {
-                        it.copy(selectedSavedDevice = null, savedDeviceCommands = emptyList())
+            runCatching { repository.deleteDevice(device.id) }
+                    .onSuccess {
+                        if (_state.value.selectedSavedDevice?.id == device.id) {
+                            _state.update {
+                                it.copy(
+                                        selectedSavedDevice = null,
+                                        savedDeviceCommands = emptyList()
+                                )
+                            }
+                        }
                     }
-                }
-            } catch (e: Exception) {
-                _state.update {
-                    it.copy(
-                            lastResult = IrResult.Err.Failure(e),
-                            lastResultMessage = "Error deleting device: ${e.message}"
-                    )
-                }
-            }
+                    .onFailure { error ->
+                        _state.update {
+                            it.copy(
+                                    lastResult = IrResult.Err.Failure(error),
+                                    lastResultMessage = error.message ?: "تعذر حذف الجهاز"
+                            )
+                        }
+                    }
         }
     }
 
-    fun send(cmd: IrCommand) {
+    fun send(command: IrCommand) {
         if (_state.value.hasIr != true) {
             _state.update {
                 it.copy(
-                        lastResult = IrResult.Err.NoEmitter("IR emitter not available"),
-                        lastResultMessage = "IR emitter not available"
+                        lastResult = IrResult.Err.NoEmitter("لا يوجد باعث IR"),
+                        lastResultMessage = "جهازك لا يحتوي على باعث IR"
                 )
             }
             return
         }
 
-        val result =
-                when (val payload = cmd.payload) {
-                    is Payload.Nec -> ir.transmitNec(payload.address, payload.command)
-                }
-
+        val result = ir.transmit(command.payload)
         val message =
                 when (result) {
                     is IrResult.Ok -> result.info
-                    is IrResult.Err.NoEmitter -> "No IR emitter: ${result.reason}"
-                    is IrResult.Err.Invalid -> "Invalid: ${result.reason}"
-                    is IrResult.Err.Failure -> "Error: ${result.cause.message}"
+                    is IrResult.Err.NoEmitter -> "لا يوجد باعث: ${result.reason}"
+                    is IrResult.Err.Invalid -> "إشارة غير صحيحة: ${result.reason}"
+                    is IrResult.Err.Failure -> "خطأ: ${result.cause.message}"
                 }
-
         _state.update { it.copy(lastResult = result, lastResultMessage = message) }
     }
 
     fun clearLastResult() {
         _state.update { it.copy(lastResult = null, lastResultMessage = null) }
+    }
+
+    fun clearSnackbar() {
+        _state.update { it.copy(snackbarMessage = null) }
     }
 }

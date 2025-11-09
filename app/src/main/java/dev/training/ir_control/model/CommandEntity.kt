@@ -22,8 +22,15 @@ data class CommandEntity(
         @PrimaryKey(autoGenerate = true) val id: Long = 0,
         val deviceId: Long,
         val label: String,
-        val protocol: String, // Stored as string, converted using TypeConverter
-        val address: Int,
-        val command: Int,
-        val frequencyHz: Int = 38000
+        val protocol: Protocol,
+        val address: Int? = null,
+        val command: Int? = null,
+        val deviceCode: Int? = null,
+        val mode: Int? = null,
+        val toggle: Int? = null,
+        val bits: Int? = null,
+        val vendor: Int? = null,
+        val frequencyHz: Int? = null,
+        val rawPattern: List<Int>? = null,
+        val repeat: Boolean = false
 )

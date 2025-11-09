@@ -8,5 +8,7 @@ import androidx.room.PrimaryKey
 data class DeviceEntity(
         @PrimaryKey(autoGenerate = true) val id: Long = 0,
         val brandName: String,
-        val modelName: String?
+        val modelName: String?,
+        val defaultProtocol: Protocol? = null,
+        val defaultFrequencyHz: Int? = null
 )
